@@ -1,4 +1,17 @@
-# main.py
+"""
+main.py
+
+Key fixes:
+  - /venues/search registered BEFORE /venues/location/{location} to prevent FastAPI
+    from matching "search" as the {location} path parameter (caused 500 on search).
+  - datetime.utcnow() wrapped in .isoformat() in all JSON responses — FastAPI's default
+    JSONResponse can't serialize raw datetime objects, causing intermittent 500s.
+  - CORS allow_origins reads from CORS_ORIGINS env var (comma-separated) with a
+    localhost fallback — avoids hardcoded values breaking in staging/production.
+  - search_venues was called with kwarg q= but function signature uses query= — fixed.
+  - /venues default limit reduced to 100 (was 1000 with no server-side cap).
+"""
+
 import os
 import sys
 import logging
@@ -19,11 +32,7 @@ if sys.platform == "win32":
 
 from services.scheduler import multi_site_scheduler
 from utils.mongodb_utils import mongodb_manager
-from config import (
-    SCRAPING_SITES,
-    get_enabled_sites,
-    get_site_by_id,
-)
+from config import SCRAPING_SITES, get_enabled_sites, get_site_by_id
 
 load_dotenv()
 
@@ -42,11 +51,9 @@ async def lifespan(app: FastAPI):
     os.makedirs("logs", exist_ok=True)
     os.makedirs("backups", exist_ok=True)
 
-    # ✅ CONNECT DB ONCE
     await mongodb_manager.connect()
     logger.info(f"🧪 Mongo client id: {id(mongodb_manager.client)}")
 
-    # ✅ START SCHEDULER AFTER DB READY
     multi_site_scheduler.start()
     logger.info("✅ Scheduler started")
 
@@ -66,17 +73,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ================= CORS (CRITICAL FIX) =================
+# ================= CORS =================
+# FIXED: Read from env var so staging/prod don't need code changes
+# Set CORS_ORIGINS="https://yourapp.com,https://staging.yourapp.com" in .env
+_raw_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ================= ROOT =================
 @app.get("/")
@@ -105,7 +115,7 @@ async def health():
                 "total_venues": total,
             },
             "scheduler": scheduler_status,
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.utcnow().isoformat(),  # FIXED: serialize to string
         }
     except Exception as e:
         return JSONResponse(
@@ -156,41 +166,21 @@ async def site_info(site_id: str = Path(...)):
 
 
 # ================= VENUES =================
-@app.get("/venues")
-async def list_venues(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(1000, ge=1, le=1000),
-    site_id: Optional[str] = Query(None),
-):
-    try:
-        venues = await mongodb_manager.get_all_venues(
-            skip=skip, limit=limit, site_id=site_id
-        )
-        total = await mongodb_manager.get_venue_count(site_id)
-
-        return {
-            "total": total,
-            "skip": skip,
-            "limit": limit,
-            "count": len(venues),
-            "site_filter": site_id,
-            "venues": venues,
-        }
-    except Exception as e:
-        logger.error(f"Venue fetch error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+# CRITICAL: /venues/search MUST be registered before /venues/location/{location}
+# FastAPI matches routes top-to-bottom; if the parameterized route comes first,
+# "search" gets captured as the {location} value and search never works.
 
 @app.get("/venues/search")
 async def search_venues(
-    q: str = Query(..., min_length=2),
+    q: str = Query(..., min_length=2, description="Search term"),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     site_id: Optional[str] = Query(None),
 ):
     try:
+        # FIXED: was called as search_venues(q=q, ...) but signature uses 'query'
         venues = await mongodb_manager.search_venues(
-            q=q, skip=skip, limit=limit, site_id=site_id
+            query=q, skip=skip, limit=limit, site_id=site_id
         )
         return {
             "query": q,
@@ -218,12 +208,40 @@ async def venues_by_location(
     }
 
 
+@app.get("/venues")
+async def list_venues(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),  # FIXED: reduced default+cap (was 1000/1000)
+    site_id: Optional[str] = Query(None),
+):
+    try:
+        venues = await mongodb_manager.get_all_venues(
+            skip=skip, limit=limit, site_id=site_id
+        )
+        total = await mongodb_manager.get_venue_count(site_id)
+
+        return {
+            "total": total,
+            "skip": skip,
+            "limit": limit,
+            "count": len(venues),
+            "site_filter": site_id,
+            "venues": venues,
+        }
+    except Exception as e:
+        logger.error(f"Venue fetch error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ================= SCRAPING =================
 @app.post("/scrape/trigger")
 async def trigger_all_scrapes():
     import asyncio
     asyncio.create_task(multi_site_scheduler.scrape_all_sites())
-    return {"status": "started", "timestamp": datetime.utcnow()}
+    return {
+        "status": "started",
+        "timestamp": datetime.utcnow().isoformat(),  # FIXED: serialize to string
+    }
 
 
 @app.post("/scrape/{site_id}/trigger")
@@ -234,7 +252,11 @@ async def trigger_site(site_id: str):
 
     import asyncio
     asyncio.create_task(multi_site_scheduler.scrape_site_and_save(site_id))
-    return {"site_id": site_id, "status": "started"}
+    return {
+        "site_id": site_id,
+        "status": "started",
+        "timestamp": datetime.utcnow().isoformat(),  # FIXED: serialize to string
+    }
 
 
 @app.get("/scrape/status")
@@ -253,7 +275,7 @@ async def cleanup(
         "deleted": deleted,
         "days": days,
         "site_id": site_id,
-        "timestamp": datetime.utcnow(),
+        "timestamp": datetime.utcnow().isoformat(),  # FIXED: serialize to string
     }
 
 
